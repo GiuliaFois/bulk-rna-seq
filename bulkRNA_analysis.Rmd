@@ -1,0 +1,454 @@
+---
+title: "RNA_bulk_analysis"
+author: "Giulia Fois"
+output: html_document
+---
+# Useful functions
+
+These are functions that I elaborated based on the fact that the main preliminary steps for the three datasets are the same
+```{r}
+library(knitr)
+library(recount)
+library(recount3)
+library(edgeR)
+
+extract_samples <- function(rse_table, startColumn, tissue) {
+  message(paste("Analysis for tissue: ", tissue))
+  found_samples <- 0
+  currColumn <- startColumn
+  retCols <- "Samples:"
+  samples <- vector()
+  while(found_samples < 3) {
+    rin <- colData(rse_table)$gtex.smrin[currColumn]
+    rRNA <- colData(rse_table)$gtex.smrrnart[currColumn]
+    mapPercent <- colData(rse_table)$"recount_qc.star.uniquely_mapped_reads_%_both"[currColumn]
+    if(rin >= 7 && rRNA < 0.1 && mapPercent >= 85) {
+      message(paste("Valid sample: ", currColumn))
+      message(paste("RIN: ", rin))
+      message(paste("rRNA: ", rRNA))
+      message(paste("map %: ", mapPercent))
+      retCols <- paste(paste(retCols, " "), currColumn)
+      found_samples <- found_samples + 1
+      samples <- c(samples, currColumn)
+     # samples[found_samples] <- currColumn
+    }
+    currColumn <- currColumn + 1
+  }
+  message(retCols)
+  samples
+}
+
+show_stats <- function(rse_table, tissue) {
+  tissue_cellTypes <- data.frame(table(colData(rse_table)$gtex.smtsd))
+  colnames(tissue_cellTypes) <- c("Cell type", "Frequency")
+  print(kable(tissue_cellTypes, caption=paste0(tissue, " samples' cell types distribution")))
+  sample_sex <- data.frame(table(colData(rse_table)$gtex.sex))
+  colnames(sample_sex) <- c("Sex", "Frequency")
+  levels(sample_sex$Sex) <- c(levels(sample_sex$Sex), "Male", "Female") 
+  sample_sex$Sex <- c("Male", "Female")
+  print(kable(sample_sex, caption=paste0(tissue, " samples' sex distribution")))
+  sample_age <- data.frame(table(colData(rse_table)$gtex.age))
+  colnames(sample_age) <- c("Age", "Frequency")
+  print(kable(sample_age, caption=paste0(tissue, " samples' age distribution")))
+  rin <- colData(rse_table)$gtex.smrin
+  mapped_reads <- colData(rse_table)$"recount_qc.star.uniquely_mapped_reads_%_both"
+  rrna <- colData(rse_table)$gtex.smrrnart
+  chrM <- colData(rse_table)$"recount_qc.aligned_reads%.chrm"
+  list(rin, mapped_reads, rrna, chrM)
+}
+
+plot_sex <- function(rse_table, tissue) {
+  gtex_sex_1 <- colData(rse_table)$"recount_qc.aligned_reads%.chry"[colData(rse_table)$gtex.sex == 1]
+  gtex_sex_2 <- colData(rse_table)$"recount_qc.aligned_reads%.chry"[colData(rse_table)$gtex.sex == 2]
+  plots <- list(gtex_sex_1, gtex_sex_2)
+  names(plots) <- c("gtex.sex = 1", "gtex.sex = 2")
+  boxplot(plots, at=c(1,2), ylab="% reads mapped on chrY", 
+          xlab=paste0(tissue, " samples"), col=c("Blue", "Red"))
+}
+
+filter_data <- function(rse_table) {
+  #Remove the genes coding for rRNA
+  rse_table_filtered <- rse_table[rowData(rse_table)$gbkey != 'rRNA' & 
+                                    !is.na(rowData(rse_table)$gbkey),]
+  #Remove the genes coming from chrM
+  rse_table_filtered <- rse_table_filtered[rowRanges(rse_table_filtered)@seqnames != "chrM", ]
+  #Remove the pseudogenes
+  rse_table_filtered <- rse_table_filtered[
+    rowData(rse_table_filtered)$gbkey != 'Gene' &
+      !is.na(rowData(rse_table_filtered)$gbkey),]
+  
+  rse_table_filtered
+}
+
+remove_non_canonical_chr <- function(rse_table) {
+  canonicalChr <- sprintf("chr%s",seq(1:22))
+  canonicalChr <- c(canonicalChr, "chrX", "chrY", "chrM")  
+  rse_table_canonical <- rse_table[rowRanges(rse_table)@seqnames %in% canonicalChr, ]
+  
+}
+
+print_count_genes <- function(rse_table, canonical_rse_table, filtered_rse_table, tissue) {
+  message(paste("Gene counts for tissue %s\n", tissue))
+  message(paste("Total #genes %d\n", dim(rse_table)[0]))
+  message(paste("#genes on canonical chromosomes %d\n", dim(canonical_rse_table)[0]))
+  message(paste("#genes on filtered table (not on chrM, not rRNA genes, not pseudogenes) %d\n", dim(filtered_rse_table)[0]))
+  
+}
+
+extract_counts <- function(rse_table, tissue) {
+  canonical_rse_table <- remove_non_canonical_chr(rse_table)
+  samples <- extract_samples(canonical_rse_table, 11, tissue)
+  rse_table_samples <- canonical_rse_table[, samples]
+  rm(canonical_rse_table)
+  list(rse_table_samples, samples)
+
+}
+
+print_genes <- function(tissue_vector, fileName) {
+  tissueFd <- file(fileName, "wb")
+  writeBin(paste(tissue_vector, collapse="\n"), tissueFd)
+  close(tissueFd)
+}
+```
+
+# Sample selection
+
+## Brain
+
+Since the brain sample is the heavier one in terms of data, I will pre-process it first, in order to be able to remove from the main memory the entire object and only keep the data related to the three samples I am interested in. This allows me to save space and to process smoothly the lung and liver objects as well.
+```{r}
+rse_brain <- readRDS("data/rse_brain.RDS")
+assays(rse_brain)$counts <- transform_counts(rse_brain)
+```
+
+To make statistics clearer, let's assess which samples have sex M or F. The gtex.sex field in colData only contains integer values in {1, 2}: let's find out which one corresponds to male and which one to female.
+
+```{r}
+plot_sex(rse_brain, "Brain")
+```
+We clearly see that the samples having gtex.sex = 1 have on average a bigger percentage of reads mapped on chromosome Y with respect to the ones having gtex.sex = 2. The latter's values, in fact, apart from few outliers, are all 0. 
+For simplicity, the bulk_analysis_functions code will already include this assumption.
+
+I show some categorical statistics and extract the columns I will perform quality control on, to later compare their distribution with respect to the corresponding ones of liver and lung samples.
+
+```{r, message=FALSE}
+tissues <- c("Brain", "Liver", "Lung")
+rin_distribution <- list()
+mapped_reads_distribution <- list()
+rrna_distribution <- list()
+chrm_distribution <- list()
+
+qc_params_distribution <- show_stats(rse_brain, "Brain")
+rin_distribution$Brain <- qc_params_distribution[[1]]
+mapped_reads_distribution$Brain <- qc_params_distribution[[2]]
+rrna_distribution$Brain <- qc_params_distribution[[3]]
+chrm_distribution$Brain <- qc_params_distribution[[4]]
+```
+
+
+```{r}
+rse_brain_data <- extract_counts(rse_brain, "Brain")
+rse_brain_selected <- rse_brain_data[[1]]
+brain_colnames <- sprintf("Brain%s", rse_brain_data[[2]])
+gc()
+```
+
+
+# Liver and Lung
+```{r}
+rse_liver <- readRDS("data/rse_liver.RDS")
+rse_lung <- readRDS("data/rse_lung.RDS")
+assays(rse_liver)$counts <- transform_counts(rse_liver)
+assays(rse_lung)$counts <- transform_counts(rse_lung)
+```
+
+I repeat the same analysis related to sex with the lung and liver objects as well.
+
+```{r}
+plot_sex(rse_liver, "Liver")
+plot_sex(rse_lung, "Lung")
+```
+
+
+```{r}
+qc_params_distribution <- show_stats(rse_liver, "Liver")
+rin_distribution$Liver <- qc_params_distribution[[1]]
+mapped_reads_distribution$Liver <- qc_params_distribution[[2]]
+rrna_distribution$Liver <- qc_params_distribution[[3]]
+chrm_distribution$Liver <- qc_params_distribution[[4]]
+```
+
+```{r}
+qc_params_distribution <- show_stats(rse_lung, "Lung")
+rin_distribution$Lung <- qc_params_distribution[[1]]
+mapped_reads_distribution$Lung <- qc_params_distribution[[2]]
+rrna_distribution$Lung <- qc_params_distribution[[3]]
+chrm_distribution$Lung <- qc_params_distribution[[4]]
+```
+I now combine the distributions of the quality control parameters to obtain three plots and be able to compare the distributions.
+
+```{r}
+names <- c("Brain", "Liver", "Lung")
+names(rin_distribution) <- names
+names(mapped_reads_distribution) <- names
+names(rrna_distribution) <- names
+boxplot(rin_distribution, at=c(1,2,3), ylab="RIN", 
+          xlab="Samples", col=c("Blue", "Orange", "Green"))
+boxplot(mapped_reads_distribution, at=c(1,2,3), ylab="% reads mapped on both strands", 
+          xlab="Samples", col=c("Blue", "Orange", "Green"))
+boxplot(rrna_distribution, at=c(1,2,3), ylab="% reads mapped on rRNA", 
+          xlab="Samples", col=c("Blue", "Orange", "Green"))
+
+
+```
+
+
+```{r}
+rse_liver_data <- extract_counts(rse_liver, "Liver")
+rse_liver_selected <- rse_liver_data[[1]]
+liver_colnames <- sprintf("Liver%s", rse_liver_data[[2]])
+rse_lung_data <- extract_counts(rse_lung, "Lung")
+rse_lung_selected <- rse_lung_data[[1]]
+lung_colnames <- sprintf("Lung%s", rse_lung_data[[2]])
+gc()
+```
+# Normalization
+
+Let's compute the TPM table for each tissue
+```{r}
+assays(rse_brain_selected)$tpm <- getTPM(rse_brain_selected)
+assays(rse_liver_selected)$tpm <- getTPM(rse_liver_selected)
+assays(rse_lung_selected)$tpm <- getTPM(rse_lung_selected)
+```
+
+```{r}
+hist(log(assays(rse_brain_selected)$tpm), main="TPM in brain samples", xlab = "log(TPM)")
+hist(log(assays(rse_liver_selected)$tpm), main="TPM in liver samples", xlab = "log(TPM)")
+hist(log(assays(rse_lung_selected)$tpm), main="TPM in lung samples", xlab = "log(TPM)")
+```
+
+Let's now create our DGEList object with the three replicates chosen for each tissue, and enrich samples' data with information about sex, tissue slice the samples were extracted from, sex, age, %reads mapped on rRNA, %reads coming from mtDNA 
+```{r}
+x <- cbind(assays(rse_brain_selected)$counts, assays(rse_liver_selected)$counts, assays(rse_lung_selected)$counts)
+rownames(x) <- rowData(rse_brain_selected)$gene_name
+colnames(x) <- cbind(brain_colnames, liver_colnames, lung_colnames)
+group <- as.factor(cbind(replicate(3, "Brain"), replicate(3, "Liver"), replicate(3, "Lung")))
+y <- DGEList(counts=x)
+```
+
+
+```{r}
+
+y$samples$group <- group
+y$samples$rin <- as.factor(c(colData(rse_brain_selected)$gtex.smrin, 
+                               colData(rse_liver_selected)$gtex.smrin,
+                              colData(rse_lung_selected)$gtex.smrin))
+y$samples$tissue_slice <- as.factor(c(colData(rse_brain_selected)$gtex.smtsd, 
+                           colData(rse_liver_selected)$gtex.smtsd,
+                           colData(rse_lung_selected)$gtex.smtsd))
+y$samples$sex <- as.factor(c(colData(rse_brain_selected)$gtex.sex, 
+                           colData(rse_liver_selected)$gtex.sex,
+                           colData(rse_lung_selected)$gtex.sex))
+y$samples$age <- as.factor(c(colData(rse_brain_selected)$gtex.age, 
+                           colData(rse_liver_selected)$gtex.age,
+                           colData(rse_lung_selected)$gtex.age))
+y$samples$rRNA <- as.factor(c(colData(rse_brain_selected)$gtex.smrrnart, 
+                           colData(rse_liver_selected)$gtex.smrrnart,
+                            colData(rse_lung_selected)$gtex.smrrnart))
+y$samples$mapped <- as.factor(c(colData(rse_brain_selected)$"recount_qc.star.uniquely_mapped_reads_%_both", 
+                           colData(rse_liver_selected)$"recount_qc.star.uniquely_mapped_reads_%_both",
+                           colData(rse_lung_selected)$"recount_qc.star.uniquely_mapped_reads_%_both"))
+y$samples$chrM <- as.factor(c(colData(rse_brain_selected)$"recount_qc.aligned_reads%.chrm", 
+                             colData(rse_liver_selected)$"recount_qc.aligned_reads%.chrm",
+                             colData(rse_lung_selected)$"recount_qc.aligned_reads%.chrm"))
+```
+
+I remove all genes with 0 counts in all columns and filter genes with really low count values
+```{r}
+dim(y)
+table(rowSums(y$counts==0)==9)
+```
+
+```{r}
+keep.exprs <- filterByExpr(y, group=group)
+y <- y[keep.exprs,, keep.lib.sizes=FALSE]
+dim(y)
+```
+
+I compute the TPM and (log) CPM values before and after normalization
+```{r}
+logcpm_before <- cpm(y, log=TRUE)
+y <- calcNormFactors(y, method="TMM")
+logcpm_after <- cpm(y, log=TRUE)
+```
+
+
+```{r, fig.width=8}
+
+boxplot(logcpm_before,las=1, horizontal=TRUE, xlab="log(CPM)", ylab="", main="Log_cpm before TMM normalization", par=par(mar = c(6, 6, 2, 2)), col="Red")
+title(ylab="Samples", line=4)
+boxplot(logcpm_after,las=1, horizontal=TRUE, xlab="log(CPM)", ylab="", main="Log_cpm after TMM normalization", par=par(mar = c(6, 6, 2, 2)), col="Green")
+title(ylab="Samples", line=4)
+```
+These are the normalization factors computed by TMM to scale the CPM values
+
+
+```{r}
+w <- data.frame(Sample=rownames(y$samples), NormalizationFactor=y$samples$norm.factors)
+w
+gc()
+```
+
+# Differentially expressed genes
+
+Let's produce the matrix for the linear model
+```{r}
+design <- model.matrix(~0+group, data=y$samples)
+colnames(design) <- levels(y$samples$group)
+design
+```
+
+I assess whether the replicates, considered as vectors of length n = number of genes, where values are logCPM of the corresponding gene, are close in the space or not. I evaluate this through a MDS plot, that reduces the vectors to points in the 2D space.
+```{r}
+generateLegend <- function() {
+  legend(
+  "topright",
+  c("Brain", "Liver","Lung"),
+  fill = c("chartreuse", "blue", "orange"))
+}
+col <- c(replicate(3, "chartreuse"),replicate(3, "blue"),replicate(3, "orange"))
+plotMDS(logcpm_after, labels=y$samples$group, xlab="logFC dimension 1", ylab="logFC dimension 2", main="MDS plot: tissues", col=col)
+generateLegend()
+plotMDS(logcpm_after, labels=y$samples$rRNA, xlim=c(-5,6), 
+        xlab="logFC dimension 1", ylab="logFC dimension 2", main="MDS plot: % reads mapped on rRNA", col=col)
+generateLegend()
+plotMDS(logcpm_after, labels=y$samples$chrM, xlab="logFC dimension 1", ylab="logFC dimension 2", 
+        main="MDS plot: % reads mapped on mitochondrial DNA", col=col)
+generateLegend()
+plotMDS(logcpm_after, labels=y$samples$sex, xlab="logFC dimension 1", ylab="logFC dimension 2", 
+        main="MDS plot: samples' sex", col=col)
+generateLegend()
+plotMDS(logcpm_after, labels=y$samples$age, xlab="logFC dimension 1", ylab="logFC dimension 2", 
+        main="MDS plot: samples' age", col=col)
+generateLegend()
+plotMDS(logcpm_after, labels=y$samples$rin, xlab="logFC dimension 1", ylab="logFC dimension 2", 
+        main="MDS plot: RIN", col=col)
+generateLegend()
+```
+
+I estimate dispersion and evaluate the gene-specifi dispersion and the common one through a BCV plot
+```{r}
+y <- estimateDisp(y, design)
+plotBCV(y, ylab="sqrt(dispersion)")
+```
+
+
+Then, I fit data on the model and execute the quasi-linear F-test, and apply the Benjamini-Hockberg correction to compute FDR values that we will consider instead of p-value
+```{r}
+fit <- glmQLFit(y, design)
+#Liver top, brain bottom
+qlfLivB <- glmQLFTest(fit, contrast=c(-1,1,0))
+#Lung top, brain bottom
+qlfLunB <- glmQLFTest(fit, contrast=c(-1,0,1))
+#Lung top, liver bottom
+qlfLunLiv <- glmQLFTest(fit, contrast=c(0,-1,1))
+```
+
+```{r}
+resultsLivB <- topTags(qlfLivB, n=10000000,adjust.method = "BH", sort.by = "PValue", p.value=1)
+resultsLunB <- topTags(qlfLunB, n=10000000,adjust.method = "BH", sort.by = "PValue", p.value=1)
+resultsLunLiv <- topTags(qlfLunLiv, n=10000000,adjust.method = "BH", sort.by = "PValue", p.value=1)
+```
+
+The following are our differentially expressed genes, filtered by FDR (that has to be lower than 0.01) and logFC (that has to be greather than 1, that is, the FC needs to be at least double the expression)
+```{r}
+sum_livB <- summary(decideTests(qlfLivB, p.value=0.01, lfc=1))
+colnames(sum_livB) <- ("Brain ↓ vs Liver ↑")
+sum_livB
+sum_lunB <- summary(decideTests(qlfLunB, p.value=0.01, lfc=1))
+colnames(sum_lunB) <- ("Brain ↓ vs Lung ↑")
+sum_lunB
+sum_lunLiv <- summary(decideTests(qlfLunLiv, p.value=0.01, lfc=1))
+colnames(sum_lunLiv) <- ("Liver ↓ vs Lung ↑")
+sum_lunLiv
+```
+
+By using a different threshold for corrected p-value we obtain different values (but I wanted to be more restrictive, so I kept 0.01 as threshold).
+By imposing a different threshold on logFC, instead, the numbers don't change (meaning that the up and down regulated genes have logFC > 1)
+```{r}
+summary(decideTests(qlfLivB, p.value=0.05, lfc=1))
+summary(decideTests(qlfLunB, p.value=0.05, lfc=1))
+summary(decideTests(qlfLunLiv, p.value=0.05, lfc=1))
+
+summary(decideTests(qlfLivB, p.value=0.01, lfc=0))
+summary(decideTests(qlfLunB, p.value=0.01, lfc=0))
+summary(decideTests(qlfLunLiv, p.value=0.01, lfc=0))
+```
+
+
+
+Genes over-expressed in brain with respect to liver and lungs
+```{r}
+genes_BrainOverLiver <- rownames(resultsLivB)[resultsLivB$table$logFC < -1 & resultsLivB$table$FDR < 0.01 & resultsLivB$table$logCPM > 0]
+genes_BrainOverLung <- rownames(resultsLunB)[resultsLunB$table$logFC < -1 & resultsLunB$table$FDR < 0.01 & resultsLunB$table$logCPM > 0]
+
+```
+
+Genes over-expressed in liver with respect to brain and lungs
+```{r}
+genes_LiverOverBrain <- rownames(resultsLivB)[resultsLivB$table$logFC > 1 & resultsLivB$table$FDR < 0.01 & resultsLivB$table$logCPM > 0]
+genes_LiverOverLung <- rownames(resultsLunLiv)[resultsLunLiv$table$logFC < -1 & resultsLunLiv$table$FDR < 0.01 & resultsLunLiv$table$logCPM > 0]
+
+```
+
+Genes over-expressed in lung with respect to brain and liver
+```{r}
+genes_LungOverBrain <- rownames(resultsLunB)[resultsLunB$table$logFC > 1 & resultsLunB$table$FDR < 0.01 & resultsLunB$table$logCPM > 0]
+genes_LungOverLiver <- rownames(resultsLunLiv)[resultsLunLiv$table$logFC > 1 & resultsLunLiv$table$FDR < 0.01 & resultsLunLiv$table$logCPM > 0]
+```
+
+Genes over-expressed in one tissue with respect to the other two
+```{r}
+genes_BrainOver <- intersect(genes_BrainOverLiver, genes_BrainOverLung)
+genes_LiverOver <- intersect(genes_LiverOverBrain, genes_LiverOverLung)
+genes_LungOver <- intersect(genes_LungOverBrain, genes_LungOverLiver)
+```
+
+```{r}
+data.frame(Brain=length(genes_BrainOver), 
+           Liver=length(genes_LiverOver), Lung=length(genes_LungOver))
+```
+
+I remove from the list genes poorly annotated
+
+```{r}
+pattern <- "^LOC|^LINC|^MIR|^SNORD|^RPL"
+genes_BrainOver_annotated <- genes_BrainOver[!grepl(pattern, genes_BrainOver)]
+genes_LiverOver_annotated <- genes_LiverOver[!grepl(pattern, genes_LiverOver)]
+genes_LungOver_annotated <- genes_LungOver[!grepl(pattern, genes_LungOver)]
+```
+
+```{r}
+print_genes(genes_BrainOver_annotated, "brainOver.txt")
+print_genes(genes_LiverOver_annotated, "liverOver.txt")
+print_genes(genes_LungOver_annotated, "lungOver.txt")
+gc()
+```
+
+Let's now choose a gene over-expressed in liver with respect to brain and lung. We choose the first in the list (that is sorted by FDR value) that has at least two alternative transcripts. We obtain a boxplot for TPM comparison in the three tissues and perform a Wilcoxon test.
+
+```{r}
+liver_gene_choice <- genes_LiverOver[5]
+liver_gene_choice
+
+assays(rse_brain)$tpm <- getTPM(rse_brain)
+assays(rse_liver)$tpm <- getTPM(rse_liver)
+assays(rse_lung)$tpm <- getTPM(rse_lung)
+
+itih1_idx <- which(rowData(rse_liver)$gene_name == "ITIH1")
+itih1_tpm <- list(Liver=assays(rse_liver)$tpm[itih1_idx,], Brain=assays(rse_brain)$tpm[itih1_idx,], Lung=assays(rse_lung)$tpm[itih1_idx,])
+boxplot(itih1_tpm, outline=F, ylab="TPM", xlab="Tissues", col=c("orange", "lightblue", "green"))
+wilcox.test(assays(rse_liver)$tpm[itih1_idx,], assays(rse_brain)$tpm[itih1_idx,], paired=FALSE)
+wilcox.test(assays(rse_liver)$tpm[itih1_idx,], assays(rse_lung)$tpm[itih1_idx,], paired=FALSE)
+```
+
